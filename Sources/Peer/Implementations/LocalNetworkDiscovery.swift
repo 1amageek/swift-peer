@@ -68,13 +68,13 @@ public actor LocalNetworkDiscovery: PeerDiscovery {
         #if canImport(Network)
         return AsyncThrowingStream { continuation in
             let browsingTask = Task {
-                await self.startBrowsing(continuation: continuation, timeout: timeout)
+                self.startBrowsing(continuation: continuation, timeout: timeout)
             }
 
-            continuation.onTermination = { @Sendable _ in
+            continuation.onTermination = { @Sendable [weak self] _ in
                 browsingTask.cancel()
-                Task {
-                    await self.stopBrowsing()
+                Task { [weak self] in
+                    await self?.stopBrowsing()
                 }
             }
         }
@@ -195,7 +195,7 @@ public actor LocalNetworkDiscovery: PeerDiscovery {
         }
     }
 
-    private func stopBrowsing() {
+    private func stopBrowsing() async {
         browser?.cancel()
         browser = nil
     }

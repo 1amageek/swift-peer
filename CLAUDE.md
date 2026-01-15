@@ -279,3 +279,81 @@ try await transport.close()
 
 - Swift 6.2+
 - macOS 26+, iOS 18+, tvOS 18+, watchOS 11+, visionOS 2+
+
+---
+
+## grpc-swift-2 API Reference
+
+### Dependencies
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/grpc/grpc-swift-2.git", from: "2.2.1"),
+    .package(url: "https://github.com/grpc/grpc-swift-nio-transport.git", from: "2.4.0"),
+]
+```
+
+### Imports
+
+```swift
+import GRPCCore
+import GRPCNIOTransportHTTP2
+// GRPCNIOTransportCore is re-exported by GRPCNIOTransportHTTP2
+```
+
+### Server Transport
+
+```swift
+// Server address uses GRPCNIOTransportCore.SocketAddress
+// SocketAddress has static factory methods: .ipv4(host:port:), .ipv6(host:port:), .unixDomainSocket(path:)
+
+let serverTransport = HTTP2ServerTransport.Posix(
+    address: .ipv4(host: "127.0.0.1", port: 50051),
+    transportSecurity: .plaintext
+)
+
+let server = GRPCServer(
+    transport: serverTransport,
+    services: [myService]
+)
+
+// Start server (runs until cancelled)
+Task {
+    try await server.serve()
+}
+
+// Get listening address (async throws)
+guard let address = try await server.listeningAddress else {
+    throw Error.serverBindFailed
+}
+```
+
+### Client Transport
+
+```swift
+// Client target uses ResolvableTargets (different from SocketAddress)
+// DEPRECATED: .ipv4(host:port:) → Use .ipv4(address:port:) instead
+
+let clientTransport = try HTTP2ClientTransport.Posix(
+    target: .ipv4(address: "127.0.0.1", port: 50051),  // ← "address" not "host"
+    transportSecurity: .plaintext
+)
+
+let client = GRPCClient(transport: clientTransport)
+
+// Run client connections (background task)
+Task {
+    try await client.runConnections()
+}
+```
+
+### Key Differences
+
+| Component | Server | Client |
+|-----------|--------|--------|
+| Type | `HTTP2ServerTransport.Posix` | `HTTP2ClientTransport.Posix` |
+| Address param | `address: SocketAddress` | `target: ResolvableTarget` |
+| IPv4 factory | `.ipv4(host:port:)` | `.ipv4(address:port:)` ← renamed |
+| Init throws | No | Yes (`try`) |
+| Run method | `serve()` | `runConnections()` |
+| Get address | `listeningAddress` (async throws) | N/A |

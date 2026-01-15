@@ -2,6 +2,7 @@ import Foundation
 import Peer
 import GRPCCore
 import GRPCNIOTransportHTTP2
+import GRPCNIOTransportCore
 import Synchronization
 
 /// gRPC-based implementation of DistributedTransport with bidirectional streaming.
@@ -207,7 +208,7 @@ public final class GRPCTransport: DistributedTransport, Sendable {
 
     private func startClient() async throws {
         let transport = try ClientTransportType(
-            target: .ipv4(host: configuration.host, port: configuration.port),
+            target: .ipv4(address: configuration.host, port: configuration.port),
             transportSecurity: .plaintext
         )
 
