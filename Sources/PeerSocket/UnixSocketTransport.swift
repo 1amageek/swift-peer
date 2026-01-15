@@ -7,27 +7,48 @@ import NIOFoundationCompat
 
 // MARK: - UnixSocketTransport
 
-/// A transport implementation using Unix domain sockets for local IPC.
-/// Uses SwiftNIO for efficient async I/O.
-public final class UnixSocketTransport: DistributedTransport, Sendable {
+/// A Unix socket client transport for connecting to a server.
+///
+/// `UnixSocketTransport` represents a single client connection to a Unix socket server.
+/// For accepting multiple client connections, use `UnixSocketServer` instead.
+///
+/// ## Usage
+///
+/// ```swift
+/// let transport = UnixSocketTransport(path: "/tmp/myapp.sock")
+/// try await transport.start()
+///
+/// // Send messages
+/// try await transport.send(.invocation(envelope))
+///
+/// // Receive messages
+/// for try await envelope in transport.messages {
+///     // Handle message
+/// }
+///
+/// // Cleanup
+/// await transport.stop()
+/// ```
+///
+public final class UnixSocketTransport: DistributedTransport, @unchecked Sendable {
 
     // MARK: - Types
 
-    public enum Mode: Sendable {
-        case server
-        case client
+    private enum ConnectionState: Sendable {
+        case disconnected
+        case connecting
+        case connected
+        case closing
+        case closed
     }
 
     // MARK: - Private State
 
     private struct TransportState: ~Copyable {
-        var serverChannel: (any Channel)?
-        var clientChannels: [ObjectIdentifier: any Channel] = [:]
-        var clientChannel: (any Channel)?
-        var isStopped: Bool = false
+        var channel: (any Channel)?
+        var connectionState: ConnectionState = .disconnected
     }
 
-    private let mode: Mode
     private let path: String
     private let group: MultiThreadedEventLoopGroup
     private let state: Mutex<TransportState>
@@ -36,12 +57,8 @@ public final class UnixSocketTransport: DistributedTransport, Sendable {
 
     // MARK: - Public Properties
 
+    /// The socket path to connect to.
     public var socketPath: String { path }
-    public var isServer: Bool { mode == .server }
-
-    public var clientCount: Int {
-        state.withLock { $0.clientChannels.count }
-    }
 
     // MARK: - DistributedTransport
 
@@ -51,8 +68,10 @@ public final class UnixSocketTransport: DistributedTransport, Sendable {
 
     // MARK: - Initialization
 
-    public init(mode: Mode, path: String) {
-        self.mode = mode
+    /// Creates a new Unix socket client transport.
+    ///
+    /// - Parameter path: The path to the Unix socket to connect to.
+    public init(path: String) {
         self.path = path
         self.group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.state = Mutex(TransportState())
@@ -71,39 +90,52 @@ public final class UnixSocketTransport: DistributedTransport, Sendable {
     // MARK: - Lifecycle
 
     public func start() async throws {
-        switch mode {
-        case .server:
-            try await startServer()
-        case .client:
-            try await startClient()
+        let currentState = state.withLock { s -> ConnectionState in
+            let current = s.connectionState
+            if current == .disconnected {
+                s.connectionState = .connecting
+            }
+            return current
+        }
+
+        switch currentState {
+        case .disconnected:
+            break // proceed
+        case .connecting, .connected:
+            throw UnixSocketError.alreadyConnected
+        case .closing, .closed:
+            throw UnixSocketError.alreadyClosed
+        }
+
+        do {
+            try await connect()
+        } catch {
+            // Only reset to disconnected if we're still in connecting state.
+            // If stop() was called during connect(), state is now closed
+            // and we should NOT reset it to disconnected (which would allow restart).
+            state.withLock { s in
+                if s.connectionState == .connecting {
+                    s.connectionState = .disconnected
+                }
+            }
+            throw error
         }
     }
 
     public func stop() async {
-        let (serverChannel, clientChannels, clientChannel) = state.withLock { s -> ((any Channel)?, [any Channel], (any Channel)?) in
-            guard !s.isStopped else { return (nil, [], nil) }
-            s.isStopped = true
-            let result = (s.serverChannel, Array(s.clientChannels.values), s.clientChannel)
-            s.serverChannel = nil
-            s.clientChannels = [:]
-            s.clientChannel = nil
-            return result
+        let channel = state.withLock { s -> (any Channel)? in
+            guard s.connectionState != .closing && s.connectionState != .closed else {
+                return nil
+            }
+            s.connectionState = .closing
+            let chan = s.channel
+            s.channel = nil
+            s.connectionState = .closed
+            return chan
         }
 
-        // Close all channels
-        for channel in clientChannels {
+        if let channel {
             try? await channel.close()
-        }
-        if let clientChannel {
-            try? await clientChannel.close()
-        }
-        if let serverChannel {
-            try? await serverChannel.close()
-        }
-
-        // Cleanup socket file for server
-        if mode == .server {
-            try? FileManager.default.removeItem(atPath: path)
         }
 
         messageContinuation.finish()
@@ -112,11 +144,12 @@ public final class UnixSocketTransport: DistributedTransport, Sendable {
     // MARK: - Send
 
     public func send(_ envelope: Envelope) async throws {
-        let channel: (any Channel)? = state.withLock { s in
-            if mode == .server {
-                return s.clientChannels.values.first
-            } else {
-                return s.clientChannel
+        let channel = state.withLock { s -> (any Channel)? in
+            switch s.connectionState {
+            case .connected:
+                return s.channel
+            case .disconnected, .connecting, .closing, .closed:
+                return nil
             }
         }
 
@@ -132,63 +165,65 @@ public final class UnixSocketTransport: DistributedTransport, Sendable {
         try await channel.writeAndFlush(buffer)
     }
 
-    // MARK: - Private: Server
+    // MARK: - Private: Connection
 
-    private func startServer() async throws {
-        let continuation = messageContinuation
-
-        let onClientConnected: @Sendable (any Channel) -> Void = { [weak self] channel in
-            self?.state.withLock { $0.clientChannels[ObjectIdentifier(channel)] = channel }
-        }
-        let onClientDisconnected: @Sendable (any Channel) -> Void = { [weak self] channel in
-            self?.state.withLock { _ = $0.clientChannels.removeValue(forKey: ObjectIdentifier(channel)) }
-        }
-
-        let bootstrap = ServerBootstrap(group: group)
-            .serverChannelOption(.socketOption(.so_reuseaddr), value: 1)
-            .childChannelInitializer { channel in
-                channel.eventLoop.makeCompletedFuture {
-                    let handler = EnvelopeChannelHandler(
-                        continuation: continuation,
-                        onActive: { onClientConnected(channel) },
-                        onInactive: { onClientDisconnected(channel) }
-                    )
-                    try channel.pipeline.syncOperations.addHandlers([
-                        ByteToMessageHandler(LengthPrefixedMessageDecoder()),
-                        handler
-                    ])
-                }
-            }
-
-        let channel = try await bootstrap.bind(unixDomainSocketPath: path, cleanupExistingSocketFile: true).get()
-        state.withLock { $0.serverChannel = channel }
-    }
-
-    // MARK: - Private: Client
-
-    private func startClient() async throws {
+    private func connect() async throws {
         let continuation = messageContinuation
 
         let bootstrap = ClientBootstrap(group: group)
             .channelInitializer { channel in
                 channel.eventLoop.makeCompletedFuture {
-                    let handler = EnvelopeChannelHandler(continuation: continuation)
+                    let handler = ClientChannelHandler(
+                        continuation: continuation,
+                        onInactive: { [weak self] in
+                            self?.handleChannelInactive()
+                        }
+                    )
                     try channel.pipeline.syncOperations.addHandlers([
-                        ByteToMessageHandler(LengthPrefixedMessageDecoder()),
+                        ByteToMessageHandler(ClientLengthPrefixedDecoder()),
                         handler
                     ])
                 }
             }
 
         let channel = try await bootstrap.connect(unixDomainSocketPath: path).get()
-        state.withLock { $0.clientChannel = channel }
+
+        // Atomically check state and set resources
+        // If stop() was called during async operations above, don't proceed
+        let shouldProceed = state.withLock { s -> Bool in
+            guard s.connectionState == .connecting else {
+                return false  // stop() was called, don't proceed
+            }
+            s.channel = channel
+            s.connectionState = .connected
+            return true
+        }
+
+        if !shouldProceed {
+            // Cancelled - clean up the channel we just created
+            try? await channel.close()
+            throw UnixSocketError.alreadyClosed
+        }
+    }
+
+    private func handleChannelInactive() {
+        let shouldFinish = state.withLock { s -> Bool in
+            guard s.connectionState == .connected else { return false }
+            s.connectionState = .closed
+            s.channel = nil
+            return true
+        }
+
+        if shouldFinish {
+            messageContinuation.finish()
+        }
     }
 }
 
-// MARK: - LengthPrefixedMessageDecoder
+// MARK: - Client Length-Prefixed Decoder
 
 /// Decodes length-prefixed messages (4-byte UInt32 length + payload).
-private final class LengthPrefixedMessageDecoder: ByteToMessageDecoder, Sendable {
+private final class ClientLengthPrefixedDecoder: ByteToMessageDecoder, Sendable {
     typealias InboundIn = ByteBuffer
     typealias InboundOut = ByteBuffer
 
@@ -208,33 +243,25 @@ private final class LengthPrefixedMessageDecoder: ByteToMessageDecoder, Sendable
     }
 }
 
-// MARK: - EnvelopeChannelHandler
+// MARK: - Client Channel Handler
 
 /// Handles incoming ByteBuffers, decodes them as Envelope, and yields to continuation.
-private final class EnvelopeChannelHandler: ChannelInboundHandler {
+private final class ClientChannelHandler: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
 
     private let continuation: AsyncThrowingStream<Envelope, Error>.Continuation
-    private let onActive: (@Sendable () -> Void)?
-    private let onInactive: (@Sendable () -> Void)?
+    private let onInactive: @Sendable () -> Void
 
     init(
         continuation: AsyncThrowingStream<Envelope, Error>.Continuation,
-        onActive: (@Sendable () -> Void)? = nil,
-        onInactive: (@Sendable () -> Void)? = nil
+        onInactive: @escaping @Sendable () -> Void
     ) {
         self.continuation = continuation
-        self.onActive = onActive
         self.onInactive = onInactive
     }
 
-    func channelActive(context: ChannelHandlerContext) {
-        onActive?()
-        context.fireChannelActive()
-    }
-
     func channelInactive(context: ChannelHandlerContext) {
-        onInactive?()
+        onInactive()
         context.fireChannelInactive()
     }
 
@@ -247,7 +274,10 @@ private final class EnvelopeChannelHandler: ChannelInboundHandler {
             let envelope = try JSONDecoder().decode(Envelope.self, from: data)
             continuation.yield(envelope)
         } catch {
-            // Silently ignore decode errors for now
+            // Report decode error and close the channel
+            // This ensures consistent state: stream finished = channel closed
+            continuation.finish(throwing: UnixSocketError.decodeError(error))
+            context.close(promise: nil)
         }
     }
 
@@ -259,12 +289,41 @@ private final class EnvelopeChannelHandler: ChannelInboundHandler {
 
 // MARK: - Errors
 
+/// Errors that can occur in Unix socket operations.
 public enum UnixSocketError: Error, Sendable {
+    /// Failed to create the socket.
     case socketCreationFailed
+
+    /// Failed to bind to the socket path.
     case bindFailed
+
+    /// Failed to listen on the socket.
     case listenFailed
+
+    /// Failed to connect to the server.
     case connectionFailed
+
+    /// Not connected to the server.
     case notConnected
+
+    /// Already connected to the server.
+    case alreadyConnected
+
+    /// The transport has been closed.
+    case alreadyClosed
+
+    /// No clients connected (server mode).
     case noClients
+
+    /// Failed to send data.
     case sendFailed
+
+    /// Failed to decode received data.
+    case decodeError(Error)
+
+    /// The server is already running.
+    case alreadyRunning
+
+    /// The server has been stopped.
+    case serverStopped
 }
