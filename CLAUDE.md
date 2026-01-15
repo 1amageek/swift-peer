@@ -2,6 +2,35 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## プロジェクト目標
+
+**Swift Distributed Actor のための P2P 通信基盤**
+
+### コア要件
+
+1. **透過的なルーティング**: ActorID から接続先を特定し、ローカル/リモートを意識せずメソッド呼び出し
+2. **P2P メッシュ**: 中央サーバーなし。全ピアが対等に通信
+3. **gRPC ベース**: HTTP/2 双方向ストリーミングで信頼性の高い通信
+
+### 設計原則
+
+1. **PeerID は接続情報を含む**: `name@host:port` 形式。接続先が自己記述的
+2. **DistributedTransport は単一接続**: 1つの Transport = 1つのピアへの接続
+3. **GRPCServer + GRPCTransport**: サーバー（接続受付）とクライアント（接続発起）を分離
+4. **GRPCServerConnection**: サーバーが受け付けた各接続も DistributedTransport として扱える
+
+### モジュール構成
+
+```
+swift-peer/
+├── Peer/           # 共通プロトコル、PeerID、re-export
+├── PeerGRPC/       # gRPC 実装
+│   ├── GRPCServer           # 接続受付サーバー
+│   ├── GRPCServerConnection # サーバー側の個別接続
+│   └── GRPCTransport        # クライアント側の接続
+└── PeerMesh/       # P2P メッシュ管理（MeshNode, PeerRegistry）
+```
+
 ## Build Commands
 
 ```bash
@@ -357,3 +386,137 @@ Task {
 | Init throws | No | Yes (`try`) |
 | Run method | `serve()` | `runConnections()` |
 | Get address | `listeningAddress` (async throws) | N/A |
+
+---
+
+## PeerNode 抽象レイヤー（設計規約）
+
+### 目的
+
+アプリケーション層（community 等）が gRPC/Socket 等の実装詳細に依存せず、
+P2P ノードを操作できる高レベル API を提供する。
+
+### モジュール依存関係
+
+```
+                ActorRuntime
+                     ↑
+                   Peer (protocols, types)
+                     ↑
+         ┌──────────┼──────────┐
+         ↓          ↓          ↓
+    PeerGRPC   PeerSocket   PeerMesh
+         ↓          ↓          ↓
+         └──────────┼──────────┘
+                    ↓
+              PeerNode [高レベル API]
+                    ↑
+            アプリケーション層
+```
+
+**重要**: アプリケーション層は `PeerNode` モジュールのみを import する。
+`PeerGRPC`, `PeerSocket` を直接 import してはならない。
+
+### PeerNode モジュール構成
+
+```
+swift-peer/Sources/PeerNode/
+├── PeerNode.swift        # メインクラス
+├── PeerNodeError.swift   # エラー定義
+├── IncomingConnection.swift
+└── exports.swift         # @_exported import Peer
+```
+
+### PeerNode API
+
+```swift
+@_exported import Peer
+
+public final class PeerNode: Sendable {
+
+    /// トランスポート種別（内部実装の選択）
+    public enum Transport: Sendable {
+        case grpc
+        case unixSocket(path: String)
+    }
+
+    public init(
+        name: String,
+        host: String = "127.0.0.1",
+        port: Int = 0,
+        transport: Transport = .grpc
+    )
+
+    // Lifecycle
+    public func start() async throws
+    public func stop() async
+
+    // Connection
+    public func connect(to peer: PeerID) async throws
+    public func disconnect(from peer: PeerID) async
+    public var incomingConnections: AsyncStream<IncomingConnection> { get }
+
+    // Discovery (mDNS/Bonjour)
+    public func advertise(metadata: [String: String] = [:]) async throws
+    public func stopAdvertising() async
+    public func discover(timeout: Duration) async -> AsyncThrowingStream<DiscoveredPeer, Error>
+
+    // State
+    public var localPeerID: PeerID { get }
+    public var boundPort: Int? { get }
+    public var connectedPeers: [PeerID] { get }
+    public func transport(for peer: PeerID) -> (any DistributedTransport)?
+}
+```
+
+### PeerNodeError
+
+```swift
+public enum PeerNodeError: Error, LocalizedError, Sendable {
+    case portUnavailable(port: Int)       // "ポート 50051 は使用中です"
+    case startFailed(String)              // 起動失敗
+    case connectionFailed(peer: PeerID, reason: String)
+    case notStarted
+    case alreadyStarted
+    case advertisingFailed(String)        // mDNS 広告失敗
+}
+```
+
+### DiscoveredPeer
+
+```swift
+public struct DiscoveredPeer: Sendable {
+    public let name: String
+    public let peerID: PeerID
+    public let metadata: [String: String]
+}
+```
+
+### ルートキーの仕様
+
+PeerNode は `host:port` をルートキーとして使用する（`name@host:port` ではない）:
+
+```swift
+// routes のキー = peer.address (host:port)
+// peerIDs のキー = peer.address (host:port) → 完全な PeerID
+
+// 例:
+// routes["192.168.1.100:50051"] = GRPCTransport
+// peerIDs["192.168.1.100:50051"] = PeerID("alice@192.168.1.100:50051")
+```
+
+**理由**: クライアントとサーバーで name が異なる場合がある（クライアントが "target" として接続）
+
+### 禁止事項
+
+アプリケーション層は以下を**直接使用してはならない**:
+
+| 禁止 | 理由 |
+|------|------|
+| `import PeerGRPC` | 実装詳細への依存 |
+| `import PeerSocket` | 実装詳細への依存 |
+| `GRPCServer` | 低レベル API |
+| `GRPCTransport` | 低レベル API |
+| `GRPCServerConnection` | 低レベル API |
+
+**正しい依存**: `import PeerNode` のみ

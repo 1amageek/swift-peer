@@ -1,17 +1,19 @@
 # swift-peer
 
-Transport implementations for [swift-actor-runtime](https://github.com/1amageek/swift-actor-runtime)'s distributed actor system.
+P2P networking library for [swift-actor-runtime](https://github.com/1amageek/swift-actor-runtime)'s distributed actor system.
 
 ## Features
 
-- **Transport-agnostic architecture**: Core protocols support any transport (gRPC, BLE, WebSocket, etc.)
-- **Mesh topology support**: Any peer can invoke methods on any other peer
+- **PeerNode**: High-level P2P abstraction with automatic port handling
+- **Transport-agnostic**: Core protocols support any transport (gRPC, BLE, WebSocket, etc.)
+- **Mesh topology**: Any peer can invoke methods on any other peer
 - **Swift 6 concurrency**: Built with modern Swift concurrency features
+- **Discovery**: mDNS/Bonjour support for local network peer discovery
 
 ## Requirements
 
 - Swift 6.2+
-- macOS 15+, iOS 18+, tvOS 18+, watchOS 11+, visionOS 2+
+- macOS 26+, iOS 18+, tvOS 18+, watchOS 11+, visionOS 2+
 
 ## Installation
 
@@ -23,7 +25,22 @@ dependencies: [
 ]
 ```
 
-Then add the target dependencies:
+### For Applications (Recommended)
+
+Use **PeerNode** for high-level P2P networking:
+
+```swift
+.target(
+    name: "YourApp",
+    dependencies: [
+        .product(name: "PeerNode", package: "swift-peer"),
+    ]
+)
+```
+
+### For Low-Level Access
+
+Use **PeerGRPC** directly (not recommended for applications):
 
 ```swift
 .target(
@@ -37,86 +54,129 @@ Then add the target dependencies:
 
 ## Modules
 
+### PeerNode (Recommended)
+
+High-level P2P abstraction for applications. Handles:
+- Automatic port binding and fallback
+- Connection management
+- Peer discovery (mDNS)
+- Transport routing
+
 ### Peer
 
 Core protocols and types for peer communication.
 
-- **Transport**: Protocol for sending/receiving data between peers
-- **PeerDiscovery**: Protocol for finding peers on the network
-- **Re-exports ActorRuntime**: `DistributedTransport`, `InvocationEnvelope`, `ResponseEnvelope`, etc.
+- **DistributedTransport**: Protocol for sending/receiving messages
+- **PeerID**: Peer identifier (`name@host:port`)
+- **Re-exports ActorRuntime**: `InvocationEnvelope`, `ResponseEnvelope`, etc.
 
 ### PeerGRPC
 
-gRPC implementation of `DistributedTransport`.
+gRPC implementation of `DistributedTransport`. Internal use only.
 
 ## Usage
 
-### GRPCTransport Configuration
+### PeerNode (Recommended)
 
 ```swift
-import Peer
-import PeerGRPC
+import PeerNode
 
-// Server mode: accepts incoming invocations
-let server = GRPCTransport(configuration: .server(port: 50051))
+// Create and start a node
+let node = PeerNode(name: "alice", host: "127.0.0.1", port: 50051)
+try await node.start()
 
-// Client mode: connects to a remote server
-let client = GRPCTransport(configuration: .client(host: "192.168.1.100", port: 50051))
+print("Listening on port \(node.boundPort!)")
+print("My PeerID: \(node.localPeerID)")
 
-// Peer mode: both server and client (for mesh networks)
-let peer = GRPCTransport(configuration: .peer(port: 50051))
-```
+// Connect to another peer
+let bob = PeerID(name: "bob", host: "192.168.1.100", port: 50051)
+try await node.connect(to: bob)
 
-### Basic Example
-
-```swift
-import Peer
-import PeerGRPC
-
-// Create and open the transport
-let transport = GRPCTransport(configuration: .peer(port: 50051))
-try await transport.open()
-
-// Use with your actor system
-let system = MyActorSystem(transport: transport)
-
-// ... communication happens via the actor system ...
-
-// Close when done
-try await transport.close()
-```
-
-### Handling Incoming Invocations
-
-```swift
-// Process incoming invocations from other peers
-for try await envelope in transport.incomingInvocations {
-    // Find the target actor
-    guard let actor = registry.find(id: envelope.recipientID) else {
-        continue
+// Handle incoming connections
+Task {
+    for await connection in node.incomingConnections {
+        print("New connection from: \(connection.peerID)")
+        // Use connection.transport for messaging
     }
-
-    // Execute the distributed method
-    let decoder = CodableInvocationDecoder(envelope: envelope)
-    let handler = CodableResultHandler()
-
-    try await executeDistributedTarget(
-        on: actor,
-        target: RemoteCallTarget(envelope.target),
-        invocationDecoder: decoder,
-        handler: handler
-    )
-
-    // Send the response
-    let response = ResponseEnvelope(
-        callID: envelope.callID,
-        result: handler.result
-    )
-    try await transport.sendResponse(response)
 }
+
+// Get transport for a connected peer
+if let transport = node.transport(for: bob) {
+    // Send messages via transport
+}
+
+// Stop when done
+await node.stop()
+```
+
+### Automatic Port Handling
+
+```swift
+// Port 0 = OS assigns available port
+let node = PeerNode(name: "alice", port: 0)
+try await node.start()
+print("Bound to port: \(node.boundPort!)")  // e.g., 52341
+```
+
+### Peer Discovery (mDNS)
+
+```swift
+// Advertise on local network
+try await node.advertise(metadata: ["version": "1.0"])
+
+// Discover peers
+let discovered = await node.discover(timeout: .seconds(5))
+for try await peer in discovered {
+    print("Found: \(peer.name) at \(peer.peerID)")
+    try await node.connect(to: peer.peerID)
+}
+
+// Stop advertising
+await node.stopAdvertising()
+```
+
+### Low-Level: GRPCTransport (Not Recommended)
+
+For advanced use cases only:
+
+```swift
+import Peer
+import PeerGRPC
+
+// Server mode
+let server = GRPCServer(configuration: .listen(host: "127.0.0.1", port: 50051))
+try await server.start()
+
+// Client mode
+let transport = GRPCTransport(configuration: .connect(
+    host: "192.168.1.100",
+    port: 50051,
+    peerID: myPeerID
+))
+try await transport.start()
 ```
 
 ## Architecture
+
+### Module Dependency
+
+```
+                ActorRuntime
+                     ↑
+                   Peer (protocols, PeerID)
+                     ↑
+         ┌──────────┼──────────┐
+         ↓          ↓          ↓
+    PeerGRPC   PeerSocket   PeerMesh
+         ↓          ↓          ↓
+         └──────────┼──────────┘
+                    ↓
+              PeerNode [High-level API]
+                    ↑
+            Application Layer
+```
+
+**Important**: Applications should only import `PeerNode`.
 
 ### Mesh Topology
 
@@ -124,8 +184,8 @@ In a mesh network, every node acts as both caller and receiver:
 
 ```
 ┌─────────────┐         ┌─────────────┐         ┌─────────────┐
-│   Peer A    │◄───────►│   Peer B    │◄───────►│   Peer C    │
-│  (Transport)│         │  (Transport)│         │  (Transport)│
+│  PeerNode A │◄───────►│  PeerNode B │◄───────►│  PeerNode C │
+│  (:50051)   │         │  (:50052)   │         │  (:50053)   │
 └─────────────┘         └─────────────┘         └─────────────┘
        ▲                                               ▲
        │                                               │
@@ -135,9 +195,23 @@ In a mesh network, every node acts as both caller and receiver:
 ### Communication Flow
 
 1. **Caller**: `distributed actor` → `remoteCall()` → `InvocationEnvelope` → `Transport.sendInvocation()`
-2. **Network**: Envelope sent via gRPC (or other transport)
+2. **Network**: Envelope sent via gRPC
 3. **Receiver**: `incomingInvocations` → actor lookup → `executeDistributedTarget()` → `ResponseEnvelope`
 4. **Caller**: Receives response, decodes result
+
+### PeerID Format
+
+```
+name@host:port
+│    │    │
+│    │    └── Port number (e.g., 50051)
+│    └─────── Host address (e.g., 127.0.0.1)
+└──────────── Peer name (e.g., alice)
+
+Example: alice@192.168.1.100:50051
+```
+
+The `address` property returns `host:port` for routing.
 
 ## Build & Test
 
@@ -149,18 +223,30 @@ swift build
 swift test
 
 # Run specific test suite
-swift test --filter PeerTests
+swift test --filter PeerNodeTests
 swift test --filter PeerGRPCTests
+```
 
-# Run a single test
-swift test --filter "GRPCTransportTests/testOpenClose"
+## Error Handling
+
+PeerNode provides clear error messages:
+
+```swift
+public enum PeerNodeError: Error {
+    case portUnavailable(port: Int)      // "Port 50051 is already in use"
+    case startFailed(String)             // Startup failure
+    case connectionFailed(peer: PeerID, reason: String)
+    case notStarted                      // Node not started yet
+    case alreadyStarted                  // Node already running
+    case advertisingFailed(String)       // mDNS advertising failed
+}
 ```
 
 ## Dependencies
 
-- [swift-actor-runtime](https://github.com/1amageek/swift-actor-runtime) >= 0.3.1
-- [grpc-swift-2](https://github.com/grpc/grpc-swift-2) >= 2.2.1
-- [grpc-swift-nio-transport](https://github.com/grpc/grpc-swift-nio-transport) >= 2.4.0
+- [swift-actor-runtime](https://github.com/1amageek/swift-actor-runtime) - Distributed Actor runtime
+- [grpc-swift-2](https://github.com/grpc/grpc-swift-2) - gRPC core
+- [grpc-swift-nio-transport](https://github.com/grpc/grpc-swift-nio-transport) - HTTP/2 transport
 
 ## License
 

@@ -254,10 +254,11 @@ public actor LocalNetworkDiscovery: PeerDiscovery {
         // For now, we create the peer with the service name
         // The actual host/port will be resolved when connecting
         // We use a placeholder endpoint that will be resolved later
+        let endpoint = Endpoint(host: "\(name).local", port: 0)
         return DiscoveredPeer(
-            peerID: PeerID(name),
+            peerID: PeerID(name: name, host: endpoint.host, port: endpoint.port),
             name: name,
-            endpoint: Endpoint(host: "\(name).local", port: 0),  // Will be resolved on connect
+            endpoint: endpoint,  // Will be resolved on connect
             metadata: metadata
         )
     }

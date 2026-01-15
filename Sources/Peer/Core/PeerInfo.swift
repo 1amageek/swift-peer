@@ -21,11 +21,11 @@ public struct PeerInfo: Sendable, Hashable, Codable {
         self.displayName = displayName
     }
 
-    /// Creates a new PeerInfo with the peer ID as the display name.
+    /// Creates a new PeerInfo with the peer's name as the display name.
     ///
     /// - Parameter peerID: The unique identifier for this peer.
     public init(peerID: PeerID) {
         self.peerID = peerID
-        self.displayName = peerID.value
+        self.displayName = peerID.name
     }
 }

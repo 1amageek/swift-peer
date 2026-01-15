@@ -7,26 +7,50 @@ struct PeerCoreTests {
 
     @Test("PeerID can be created and compared")
     func peerIDCreation() {
-        let id1 = PeerID("test-peer")
-        let id2 = PeerID("test-peer")
-        let id3 = PeerID("other-peer")
+        let id1 = PeerID(name: "test-peer", host: "localhost", port: 50051)
+        let id2 = PeerID(name: "test-peer", host: "localhost", port: 50051)
+        let id3 = PeerID(name: "other-peer", host: "localhost", port: 50051)
 
         #expect(id1 == id2)
         #expect(id1 != id3)
-        #expect(id1.value == "test-peer")
+        #expect(id1.name == "test-peer")
+        #expect(id1.host == "localhost")
+        #expect(id1.port == 50051)
+        #expect(id1.value == "test-peer@localhost:50051")
     }
 
     @Test("PeerID supports string literal initialization")
     func peerIDStringLiteral() {
-        let id: PeerID = "literal-peer"
-        #expect(id.value == "literal-peer")
+        let id: PeerID = "literal-peer@192.168.1.1:8080"
+        #expect(id.name == "literal-peer")
+        #expect(id.host == "192.168.1.1")
+        #expect(id.port == 8080)
+        #expect(id.value == "literal-peer@192.168.1.1:8080")
+    }
+
+    @Test("PeerID can be parsed from string")
+    func peerIDParsing() {
+        // Valid format - use init?(_:) failable initializer
+        let validString = "alice@10.0.0.1:50051"
+        let id = PeerID.init(validString)
+        #expect(id != nil)
+        #expect(id?.name == "alice")
+        #expect(id?.host == "10.0.0.1")
+        #expect(id?.port == 50051)
+
+        // Invalid formats return nil (failable init)
+        let invalidStrings = ["invalid", "missing@port", "@host:8080"]
+        for str in invalidStrings {
+            #expect(PeerID.init(str) == nil, "Expected nil for: \(str)")
+        }
     }
 
     @Test("PeerID broadcast")
     func peerIDBroadcast() {
         let broadcast = PeerID.broadcast
         #expect(broadcast.isBroadcast)
-        #expect(!PeerID("regular").isBroadcast)
+        let regular = PeerID(name: "regular", host: "localhost", port: 8080)
+        #expect(!regular.isBroadcast)
     }
 
     @Test("Endpoint can be created")
@@ -49,14 +73,17 @@ struct PeerCoreTests {
 
     @Test("PeerInfo can be created")
     func peerInfoCreation() {
-        let info = PeerInfo(peerID: PeerID("test"), displayName: "Test Peer")
-        #expect(info.peerID.value == "test")
+        let peerID = PeerID(name: "test", host: "localhost", port: 50051)
+        let info = PeerInfo(peerID: peerID, displayName: "Test Peer")
+        #expect(info.peerID.name == "test")
+        #expect(info.peerID.value == "test@localhost:50051")
         #expect(info.displayName == "Test Peer")
     }
 
     @Test("PeerInfo with default display name")
     func peerInfoDefaultName() {
-        let info = PeerInfo(peerID: PeerID("my-peer"))
+        let peerID = PeerID(name: "my-peer", host: "localhost", port: 8080)
+        let info = PeerInfo(peerID: peerID)
         #expect(info.displayName == "my-peer")
     }
 
@@ -82,14 +109,16 @@ struct PeerCoreTests {
 
     @Test("DiscoveredPeer can be created")
     func discoveredPeerCreation() {
+        let peerID = PeerID(name: "discovered", host: "10.0.0.1", port: 50051)
         let peer = DiscoveredPeer(
-            peerID: PeerID("discovered"),
+            peerID: peerID,
             name: "Discovered Peer",
             endpoint: Endpoint(host: "10.0.0.1", port: 50051),
             metadata: ["key": "value"]
         )
 
-        #expect(peer.peerID.value == "discovered")
+        #expect(peer.peerID.name == "discovered")
+        #expect(peer.peerID.value == "discovered@10.0.0.1:50051")
         #expect(peer.name == "Discovered Peer")
         #expect(peer.endpoint.host == "10.0.0.1")
         #expect(peer.endpoint.port == 50051)
@@ -102,11 +131,12 @@ struct TransportProtocolTests {
 
     @Test("TransportEvent cases exist")
     func transportEventCases() {
+        let peerID = PeerID(name: "peer", host: "localhost", port: 8080)
         let started = TransportEvent.started
         let stopped = TransportEvent.stopped
-        let connected = TransportEvent.peerConnected(PeerID("peer"))
-        let disconnected = TransportEvent.peerDisconnected(PeerID("peer"))
-        let received = TransportEvent.dataReceived(from: PeerID("peer"), data: Data())
+        let connected = TransportEvent.peerConnected(peerID)
+        let disconnected = TransportEvent.peerDisconnected(peerID)
+        let received = TransportEvent.dataReceived(from: peerID, data: Data())
         let error = TransportEvent.error(.timeout)
 
         // Just verify they can be created
@@ -115,13 +145,14 @@ struct TransportProtocolTests {
 
     @Test("TransportError cases exist")
     func transportErrorCases() {
+        let peerID = PeerID(name: "peer", host: "localhost", port: 8080)
         let notStarted = TransportError.notStarted
         let alreadyStarted = TransportError.alreadyStarted
-        let connectionFailed = TransportError.connectionFailed(PeerID("peer"), "reason")
-        let sendFailed = TransportError.sendFailed(PeerID("peer"), "reason")
+        let connectionFailed = TransportError.connectionFailed(peerID, "reason")
+        let sendFailed = TransportError.sendFailed(peerID, "reason")
         let closed = TransportError.connectionClosed
         let timeout = TransportError.timeout
-        let notConnected = TransportError.notConnected(PeerID("peer"))
+        let notConnected = TransportError.notConnected(peerID)
         let invalid = TransportError.invalidData("reason")
 
         _ = [notStarted, alreadyStarted, connectionFailed, sendFailed, closed, timeout, notConnected, invalid]
@@ -133,12 +164,13 @@ struct DiscoveryProtocolTests {
 
     @Test("DiscoveryEvent cases exist")
     func discoveryEventCases() {
+        let peerID = PeerID(name: "peer", host: "localhost", port: 8080)
         let appeared = DiscoveryEvent.peerAppeared(DiscoveredPeer(
-            peerID: PeerID("peer"),
+            peerID: peerID,
             name: "Peer",
             endpoint: Endpoint(host: "localhost", port: 8080)
         ))
-        let disappeared = DiscoveryEvent.peerDisappeared(PeerID("peer"))
+        let disappeared = DiscoveryEvent.peerDisappeared(peerID)
         let started = DiscoveryEvent.advertisingStarted
         let stopped = DiscoveryEvent.advertisingStopped
         let error = DiscoveryEvent.error(.timeout)

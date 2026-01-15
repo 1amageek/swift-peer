@@ -16,6 +16,7 @@ let package = Package(
         .library(name: "PeerSocket", targets: ["PeerSocket"]),
         .library(name: "PeerGRPC", targets: ["PeerGRPC"]),
         .library(name: "PeerMesh", targets: ["PeerMesh"]),
+        .library(name: "PeerNode", targets: ["PeerNode"]),
     ],
     dependencies: [
         .package(url: "https://github.com/1amageek/swift-actor-runtime.git", from: "0.4.0"),
@@ -55,6 +56,14 @@ let package = Package(
             name: "PeerMesh",
             dependencies: [
                 "Peer",
+            ]
+        ),
+        // High-level P2P node abstraction
+        .target(
+            name: "PeerNode",
+            dependencies: [
+                "Peer",
+                "PeerGRPC",
             ]
         ),
         .testTarget(
