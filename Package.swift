@@ -19,7 +19,7 @@ let package = Package(
         .library(name: "PeerNode", targets: ["PeerNode"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/1amageek/swift-actor-runtime.git", from: "0.4.0"),
+        .package(url: "https://github.com/1amageek/swift-actor-runtime.git", from: "0.4.1"),
         .package(url: "https://github.com/grpc/grpc-swift-2.git", from: "2.2.1"),
         .package(url: "https://github.com/grpc/grpc-swift-nio-transport.git", from: "2.4.0"),
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.78.0"),
