@@ -16,7 +16,7 @@ let package = Package(
         .library(name: "PeerGRPC", targets: ["PeerGRPC"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/1amageek/swift-actor-runtime.git", from: "0.3.1"),
+        .package(url: "https://github.com/1amageek/swift-actor-runtime.git", from: "0.4.0"),
         .package(url: "https://github.com/grpc/grpc-swift-2.git", from: "2.2.1"),
         .package(url: "https://github.com/grpc/grpc-swift-nio-transport.git", from: "2.4.0"),
     ],

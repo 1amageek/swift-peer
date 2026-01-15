@@ -4,20 +4,29 @@ import GRPCCore
 import GRPCNIOTransportHTTP2
 import Synchronization
 
-/// gRPC-based implementation of DistributedTransport for distributed actor communication.
+/// gRPC-based implementation of DistributedTransport with bidirectional streaming.
 ///
-/// This transport uses gRPC to send and receive InvocationEnvelope/ResponseEnvelope
-/// for Swift distributed actors.
+/// Supports true bidirectional communication - both sides can send
+/// invocations and responses at any time.
 ///
 /// ## Usage
 ///
 /// ```swift
-/// let transport = GRPCTransport(
-///     configuration: .server(host: "0.0.0.0", port: 50051)
-/// )
+/// let transport = GRPCTransport(configuration: .server(port: 50051))
+/// try await transport.start()
 ///
-/// // For actor system integration
-/// let system = MyActorSystem(transport: transport)
+/// // Send
+/// try await transport.send(.invocation(envelope))
+///
+/// // Receive
+/// for try await envelope in transport.messages {
+///     switch envelope {
+///     case .invocation(let inv):
+///         // Handle incoming invocation
+///     case .response(let res):
+///         // Handle response
+///     }
+/// }
 /// ```
 public final class GRPCTransport: DistributedTransport, Sendable {
 
@@ -34,12 +43,10 @@ public final class GRPCTransport: DistributedTransport, Sendable {
         public let port: Int
 
         public enum Mode: Sendable {
-            /// Server mode: accepts incoming invocations
+            /// Server mode: accepts incoming connections
             case server
             /// Client mode: connects to a remote server
             case client
-            /// Both: server that also connects to other peers
-            case peer
         }
 
         public init(mode: Mode, host: String, port: Int) {
@@ -55,10 +62,6 @@ public final class GRPCTransport: DistributedTransport, Sendable {
         public static func client(host: String, port: Int) -> Configuration {
             Configuration(mode: .client, host: host, port: port)
         }
-
-        public static func peer(host: String = "0.0.0.0", port: Int = 50051) -> Configuration {
-            Configuration(mode: .peer, host: host, port: port)
-        }
     }
 
     // MARK: - Mutable State
@@ -68,6 +71,8 @@ public final class GRPCTransport: DistributedTransport, Sendable {
         var serverTask: Task<Void, Error>?
         var client: GRPCClient<ClientTransportType>?
         var clientTask: Task<Void, Error>?
+        var streamTask: Task<Void, Never>?
+        var outgoingContinuation: AsyncStream<EnvelopeMessage>.Continuation?
         var boundPort: Int?
         var isClosed: Bool = false
     }
@@ -76,19 +81,18 @@ public final class GRPCTransport: DistributedTransport, Sendable {
 
     private let configuration: Configuration
     private let mutableState: Mutex<MutableState>
-    private let pendingResponses: PendingResponses
-    private let invocationStream: AsyncThrowingStream<InvocationEnvelope, Error>
-    private let invocationContinuation: AsyncThrowingStream<InvocationEnvelope, Error>.Continuation
+    private let messageStream: AsyncThrowingStream<Envelope, Error>
+    private let messageContinuation: AsyncThrowingStream<Envelope, Error>.Continuation
 
-    /// The port the server is bound to (available after starting in server/peer mode)
+    /// The port the server is bound to (available after starting in server mode)
     public var boundPort: Int? {
         mutableState.withLock { $0.boundPort }
     }
 
-    // MARK: - DistributedTransport: incomingInvocations
+    // MARK: - DistributedTransport: messages
 
-    public var incomingInvocations: AsyncThrowingStream<InvocationEnvelope, Error> {
-        invocationStream
+    public var messages: AsyncThrowingStream<Envelope, Error> {
+        messageStream
     }
 
     // MARK: - Initialization
@@ -96,22 +100,17 @@ public final class GRPCTransport: DistributedTransport, Sendable {
     public init(configuration: Configuration) {
         self.configuration = configuration
         self.mutableState = Mutex(MutableState())
-        self.pendingResponses = PendingResponses()
 
-        // Create the invocation stream
-        var continuation: AsyncThrowingStream<InvocationEnvelope, Error>.Continuation!
-        self.invocationStream = AsyncThrowingStream { cont in
+        var continuation: AsyncThrowingStream<Envelope, Error>.Continuation!
+        self.messageStream = AsyncThrowingStream { cont in
             continuation = cont
         }
-        self.invocationContinuation = continuation
+        self.messageContinuation = continuation
     }
 
-    // MARK: - DistributedTransport: open
+    // MARK: - DistributedTransport: start
 
-    /// Opens the transport for communication.
-    ///
-    /// - Throws: `GRPCTransportError.alreadyClosed` if the transport has been closed.
-    public func open() async throws {
+    public func start() async throws {
         let isClosed = mutableState.withLock { $0.isClosed }
         if isClosed {
             throw GRPCTransportError.alreadyClosed
@@ -122,69 +121,53 @@ public final class GRPCTransport: DistributedTransport, Sendable {
             try await startServer()
         case .client:
             try await startClient()
-        case .peer:
-            try await startServer()
-            try await startClient()
         }
     }
 
-    // MARK: - DistributedTransport: sendInvocation (Client Side)
+    // MARK: - DistributedTransport: send
 
-    public func sendInvocation(_ envelope: InvocationEnvelope) async throws -> ResponseEnvelope {
-        guard let client = mutableState.withLock({ $0.client }) else {
+    public func send(_ envelope: Envelope) async throws {
+        guard let continuation = mutableState.withLock({ $0.outgoingContinuation }) else {
             throw GRPCTransportError.notConnected
         }
-
-        let request = ClientRequest(message: InvokeRequest(envelope: envelope))
-
-        let response: InvokeResponse = try await client.unary(
-            request: request,
-            descriptor: MethodDescriptor.invoke,
-            serializer: MessageSerializer<InvokeRequest>(),
-            deserializer: MessageDeserializer<InvokeResponse>(),
-            options: .defaults
-        ) { response in
-            try response.message
-        }
-
-        return response.envelope
+        continuation.yield(EnvelopeMessage(envelope: envelope))
     }
 
-    // MARK: - DistributedTransport: sendResponse (Server Side)
+    // MARK: - DistributedTransport: stop
 
-    public func sendResponse(_ envelope: ResponseEnvelope) async throws {
-        await pendingResponses.complete(callID: envelope.callID, with: envelope)
-    }
-
-    // MARK: - DistributedTransport: close
-
-    public func close() async throws {
+    public func stop() async {
         mutableState.withLock { state in
             guard !state.isClosed else { return }
             state.isClosed = true
 
-            // Stop server
+            state.outgoingContinuation?.finish()
+            state.outgoingContinuation = nil
+
+            state.streamTask?.cancel()
+            state.streamTask = nil
+
             state.server?.beginGracefulShutdown()
             state.serverTask?.cancel()
             state.serverTask = nil
             state.server = nil
 
-            // Stop client
             state.client?.beginGracefulShutdown()
             state.clientTask?.cancel()
             state.clientTask = nil
             state.client = nil
         }
 
-        invocationContinuation.finish(throwing: nil)
+        messageContinuation.finish()
     }
 
     // MARK: - Private: Server
 
     private func startServer() async throws {
         let service = GRPCTransportService(
-            invocationContinuation: invocationContinuation,
-            pendingResponses: pendingResponses
+            messageContinuation: messageContinuation,
+            getOutgoingContinuation: { [weak self] continuation in
+                self?.mutableState.withLock { $0.outgoingContinuation = continuation }
+            }
         )
 
         let transport = ServerTransportType(
@@ -206,38 +189,75 @@ public final class GRPCTransport: DistributedTransport, Sendable {
             $0.serverTask = task
         }
 
-        if let address = try await grpcServer.listeningAddress {
-            let port: Int
-            if let ipv4 = address.ipv4 {
-                port = ipv4.port
-            } else if let ipv6 = address.ipv6 {
-                port = ipv6.port
-            } else {
-                port = configuration.port
-            }
-            mutableState.withLock { $0.boundPort = port }
-        } else {
+        guard let address = try await grpcServer.listeningAddress else {
             throw GRPCTransportError.serverBindFailed
         }
+        let port: Int
+        if let ipv4 = address.ipv4 {
+            port = ipv4.port
+        } else if let ipv6 = address.ipv6 {
+            port = ipv6.port
+        } else {
+            port = configuration.port
+        }
+        mutableState.withLock { $0.boundPort = port }
     }
 
     // MARK: - Private: Client
 
     private func startClient() async throws {
         let transport = try ClientTransportType(
-            target: .ipv4(address: configuration.host, port: configuration.port),
+            target: .ipv4(host: configuration.host, port: configuration.port),
             transportSecurity: .plaintext
         )
 
         let client = GRPCClient(transport: transport)
 
-        let task = Task {
+        let clientTask = Task {
             try await client.runConnections()
         }
 
+        // Create outgoing stream
+        let (outgoingStream, outgoingContinuation) = AsyncStream<EnvelopeMessage>.makeStream()
+
         mutableState.withLock {
             $0.client = client
-            $0.clientTask = task
+            $0.clientTask = clientTask
+            $0.outgoingContinuation = outgoingContinuation
+        }
+
+        // Start bidirectional streaming
+        let streamTask = Task { [weak self] in
+            guard let self = self else { return }
+
+            do {
+                let request = StreamingClientRequest<EnvelopeMessage>(
+                    metadata: [:],
+                    producer: { writer in
+                        for await message in outgoingStream {
+                            try await writer.write(message)
+                        }
+                    }
+                )
+
+                try await client.bidirectionalStreaming(
+                    request: request,
+                    descriptor: MethodDescriptor.stream,
+                    serializer: MessageSerializer<EnvelopeMessage>(),
+                    deserializer: MessageDeserializer<EnvelopeMessage>(),
+                    options: .defaults
+                ) { response in
+                    for try await message in response.messages {
+                        self.messageContinuation.yield(message.envelope)
+                    }
+                }
+            } catch {
+                self.messageContinuation.finish(throwing: error)
+            }
+        }
+
+        mutableState.withLock {
+            $0.streamTask = streamTask
         }
     }
 }
@@ -245,22 +265,16 @@ public final class GRPCTransport: DistributedTransport, Sendable {
 // MARK: - Method Descriptors
 
 extension MethodDescriptor {
-    static let invoke = MethodDescriptor(
+    static let stream = MethodDescriptor(
         fullyQualifiedService: "actor.Transport",
-        method: "Invoke"
+        method: "Stream"
     )
 }
 
 // MARK: - Errors
 
 public enum GRPCTransportError: Error, Sendable {
-    /// No client connection is available to send invocations.
     case notConnected
-
-    /// The server failed to bind to the specified port.
     case serverBindFailed
-
-    /// The transport has been closed and cannot be reopened.
-    /// Create a new GRPCTransport instance instead.
     case alreadyClosed
 }

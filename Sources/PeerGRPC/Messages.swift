@@ -1,14 +1,9 @@
 import Foundation
 import Peer
 
-// MARK: - Invoke RPC Messages
+// MARK: - Bidirectional Streaming Message
 
-/// Request message for Invoke RPC - wraps InvocationEnvelope for gRPC transport
-struct InvokeRequest: Codable, Sendable {
-    let envelope: InvocationEnvelope
-}
-
-/// Response message for Invoke RPC - wraps ResponseEnvelope for gRPC transport
-struct InvokeResponse: Codable, Sendable {
-    let envelope: ResponseEnvelope
+/// Message for bidirectional streaming - wraps Envelope for gRPC transport
+struct EnvelopeMessage: Codable, Sendable {
+    let envelope: Envelope
 }

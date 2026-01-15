@@ -2,72 +2,63 @@ import Foundation
 import Peer
 import GRPCCore
 
-/// gRPC service implementation for handling incoming invocations.
+/// gRPC service implementation for bidirectional streaming.
 ///
-/// This service receives InvocationEnvelope from remote clients and forwards them
-/// to the transport's incomingInvocations stream.
-struct GRPCTransportService: RegistrableRPCService {
+/// Handles the Stream RPC method, enabling true bidirectional communication
+/// between client and server.
+struct GRPCTransportService: RegistrableRPCService, Sendable {
 
-    /// Continuation for pushing incoming invocations to the stream
-    let invocationContinuation: AsyncThrowingStream<InvocationEnvelope, Error>.Continuation
+    /// Continuation for pushing incoming messages to the transport
+    let messageContinuation: AsyncThrowingStream<Envelope, Error>.Continuation
 
-    /// Pending responses keyed by callID
-    let pendingResponses: PendingResponses
+    /// Callback to set the outgoing continuation when a client connects
+    let getOutgoingContinuation: @Sendable (AsyncStream<EnvelopeMessage>.Continuation) -> Void
 
     func registerMethods<Transport: ServerTransport>(with router: inout RPCRouter<Transport>) {
-        // Register Invoke handler
         router.registerHandler(
-            forMethod: MethodDescriptor.invoke,
-            deserializer: MessageDeserializer<InvokeRequest>(),
-            serializer: MessageSerializer<InvokeResponse>()
+            forMethod: MethodDescriptor.stream,
+            deserializer: MessageDeserializer<EnvelopeMessage>(),
+            serializer: MessageSerializer<EnvelopeMessage>()
         ) { request, context in
-            let singleRequest = try await ServerRequest(stream: request)
-            let singleResponse = await self.handleInvoke(request: singleRequest)
-            return StreamingServerResponse(single: singleResponse)
+            await self.handleStream(request: request, context: context)
         }
     }
 
-    // MARK: - Invoke Handler
+    // MARK: - Stream Handler
 
-    private func handleInvoke(request: ServerRequest<InvokeRequest>) async -> ServerResponse<InvokeResponse> {
-        let envelope = request.message.envelope
+    private func handleStream(
+        request: StreamingServerRequest<EnvelopeMessage>,
+        context: ServerContext
+    ) async -> StreamingServerResponse<EnvelopeMessage> {
 
-        // Create a pending response slot
-        let responseContinuation = await pendingResponses.createPending(for: envelope.callID)
+        StreamingServerResponse { writer in
+            // Create outgoing stream for server -> client messages
+            let (outgoingStream, outgoingContinuation) = AsyncStream<EnvelopeMessage>.makeStream()
 
-        // Forward to incoming invocations stream
-        invocationContinuation.yield(envelope)
+            // Provide the continuation to the transport
+            getOutgoingContinuation(outgoingContinuation)
 
-        // Wait for response from the actor system
-        let response = await responseContinuation.value
-
-        return ServerResponse(message: InvokeResponse(envelope: response))
-    }
-}
-
-// MARK: - Pending Responses Manager
-
-/// Thread-safe manager for pending response continuations.
-///
-/// When an invocation arrives, we create a pending slot and wait for the
-/// actor system to process it and call sendResponse.
-actor PendingResponses {
-
-    private var pending: [String: CheckedContinuation<ResponseEnvelope, Never>] = [:]
-
-    /// Creates a pending response slot for the given callID.
-    func createPending(for callID: String) async -> Task<ResponseEnvelope, Never> {
-        Task {
-            await withCheckedContinuation { continuation in
-                self.pending[callID] = continuation
+            // Task to write outgoing messages
+            let writeTask = Task {
+                for await message in outgoingStream {
+                    try await writer.write(message)
+                }
             }
-        }
-    }
 
-    /// Completes the pending response for the given callID.
-    func complete(callID: String, with response: ResponseEnvelope) {
-        if let continuation = pending.removeValue(forKey: callID) {
-            continuation.resume(returning: response)
+            // Process incoming messages from client
+            do {
+                for try await message in request.messages {
+                    messageContinuation.yield(message.envelope)
+                }
+            } catch {
+                messageContinuation.finish(throwing: error)
+            }
+
+            // Cleanup
+            writeTask.cancel()
+            outgoingContinuation.finish()
+
+            return [:]
         }
     }
 }

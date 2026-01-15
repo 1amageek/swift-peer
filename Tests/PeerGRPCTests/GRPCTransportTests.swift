@@ -15,37 +15,43 @@ struct GRPCTransportTests {
         #expect(transport.boundPort == nil)  // Not started yet
     }
 
-    @Test("Open and close server transport")
-    func testOpenClose() async throws {
+    @Test("Start and stop server transport")
+    func testStartStop() async throws {
         let transport = GRPCTransport(
             configuration: .server(port: 0)
         )
 
-        try await transport.open()
+        try await transport.start()
         #expect(transport.boundPort != nil)
 
-        try await transport.close()
+        await transport.stop()
     }
 
-    @Test("Send invocation between client and server")
-    func testInvocation() async throws {
+    @Test("Bidirectional streaming between client and server")
+    func testBidirectionalStreaming() async throws {
         // Server transport
         let serverTransport = GRPCTransport(
             configuration: .server(host: "127.0.0.1", port: 0)
         )
 
-        try await serverTransport.open()
+        try await serverTransport.start()
         let serverPort = serverTransport.boundPort!
 
-        // Start processing incoming invocations on server
+        // Start processing incoming messages on server
         let serverTask = Task {
-            for try await envelope in serverTransport.incomingInvocations {
-                // Echo back the arguments as success response
-                let response = ResponseEnvelope(
-                    callID: envelope.callID,
-                    result: .success(envelope.arguments)
-                )
-                try await serverTransport.sendResponse(response)
+            for try await envelope in serverTransport.messages {
+                switch envelope {
+                case .invocation(let invocation):
+                    // Echo back the arguments as success response
+                    let response = ResponseEnvelope(
+                        callID: invocation.callID,
+                        result: .success(invocation.arguments)
+                    )
+                    try await serverTransport.send(.response(response))
+                case .response:
+                    // Server shouldn't receive responses in this test
+                    break
+                }
             }
         }
 
@@ -54,29 +60,42 @@ struct GRPCTransportTests {
             configuration: .client(host: "127.0.0.1", port: serverPort)
         )
 
-        try await clientTransport.open()
+        try await clientTransport.start()
 
-        // Send invocation
+        // Create test invocation
         let testData = "Hello, World!".data(using: .utf8)!
-        let envelope = InvocationEnvelope(
+        let invocation = InvocationEnvelope(
             recipientID: "test-actor",
             target: "testMethod",
             arguments: testData
         )
 
-        let response = try await clientTransport.sendInvocation(envelope)
+        // Send invocation
+        try await clientTransport.send(.invocation(invocation))
+
+        // Wait for response
+        var receivedResponse: ResponseEnvelope?
+        for try await envelope in clientTransport.messages {
+            if case .response(let response) = envelope,
+               response.callID == invocation.callID {
+                receivedResponse = response
+                break
+            }
+        }
 
         // Verify response
-        if case .success(let data) = response.result {
+        #expect(receivedResponse != nil)
+        if let response = receivedResponse,
+           case .success(let data) = response.result {
             #expect(data == testData)
         } else {
-            Issue.record("Expected success response")
+            Issue.record("Expected success response with echoed data")
         }
 
         // Cleanup
         serverTask.cancel()
-        try await clientTransport.close()
-        try await serverTransport.close()
+        await clientTransport.stop()
+        await serverTransport.stop()
     }
 
     @Test("Void response")
@@ -85,16 +104,18 @@ struct GRPCTransportTests {
             configuration: .server(host: "127.0.0.1", port: 0)
         )
 
-        try await serverTransport.open()
+        try await serverTransport.start()
         let serverPort = serverTransport.boundPort!
 
         let serverTask = Task {
-            for try await envelope in serverTransport.incomingInvocations {
-                let response = ResponseEnvelope(
-                    callID: envelope.callID,
-                    result: .void
-                )
-                try await serverTransport.sendResponse(response)
+            for try await envelope in serverTransport.messages {
+                if case .invocation(let invocation) = envelope {
+                    let response = ResponseEnvelope(
+                        callID: invocation.callID,
+                        result: .void
+                    )
+                    try await serverTransport.send(.response(response))
+                }
             }
         }
 
@@ -102,20 +123,30 @@ struct GRPCTransportTests {
             configuration: .client(host: "127.0.0.1", port: serverPort)
         )
 
-        try await clientTransport.open()
+        try await clientTransport.start()
 
-        let envelope = InvocationEnvelope(
+        let invocation = InvocationEnvelope(
             recipientID: "test-actor",
             target: "voidMethod",
             arguments: Data()
         )
 
-        let response = try await clientTransport.sendInvocation(envelope)
+        try await clientTransport.send(.invocation(invocation))
 
-        #expect(response.result == .void)
+        // Wait for response
+        var receivedResponse: ResponseEnvelope?
+        for try await envelope in clientTransport.messages {
+            if case .response(let response) = envelope,
+               response.callID == invocation.callID {
+                receivedResponse = response
+                break
+            }
+        }
+
+        #expect(receivedResponse?.result == .void)
 
         serverTask.cancel()
-        try await clientTransport.close()
-        try await serverTransport.close()
+        await clientTransport.stop()
+        await serverTransport.stop()
     }
 }
